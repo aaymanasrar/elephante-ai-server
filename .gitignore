@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+
+venv/
+data/
+outputs/
+*.log
+
+# Model weights — too large for GitHub; store in cloud storage
+*.pt
