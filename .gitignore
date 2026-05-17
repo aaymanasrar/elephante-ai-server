@@ -9,3 +9,5 @@ outputs/
 
 # Model weights — too large for GitHub; store in cloud storage
 *.pt
+*.pth
+*.onnx

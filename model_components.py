@@ -29,7 +29,8 @@ class FashionCLIPEncoder(torch.nn.Module):
                 "open-clip-torch is required for FashionCLIP.\n"
                 "  venv/bin/pip install open-clip-torch"
             )
-        model, _, _ = open_clip.create_model_from_pretrained(self.HF_REPO)
+        result = open_clip.create_model_from_pretrained(self.HF_REPO)
+        model = result[0]
         self._clip = model
 
     def forward(self, images: torch.Tensor) -> torch.Tensor:

@@ -1,13 +1,16 @@
+import base64
 import colorsys
 import io
 import logging
 from pathlib import Path
+from typing import Optional
 
 import torch
 import torch.nn.functional as F
 from fastapi import FastAPI, File, Form, UploadFile
 from fastapi.responses import JSONResponse
 from PIL import Image, ImageOps, UnidentifiedImageError
+from starlette.concurrency import run_in_threadpool
 from torchvision import transforms
 
 from model_components import (
@@ -16,6 +19,13 @@ from model_components import (
     build_fashionclip_encoder,
     CLIP_MEAN,
     CLIP_STD,
+)
+from sam_segmentation import (
+    SamSegmenter,
+    SamUnavailableError,
+    apply_mask,
+    mask_quality,
+    mask_to_png_bytes,
 )
 
 
@@ -88,6 +98,7 @@ else:
 
 # 2. Load the compatibility head.
 match_head = load_match_head(MATCH_HEAD_PATH)
+sam_segmenter = SamSegmenter.from_env(device=device)
 
 
 def undertone_from_skin_tone(skin_tone: str) -> str:
@@ -252,16 +263,206 @@ def outfit_color_bonus(shirt_color: dict, pants_color: dict, user_undertone: str
     return bonus
 
 
+def encode_png_base64(image: Image.Image) -> str:
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    return base64.b64encode(buffer.getvalue()).decode("ascii")
+
+
+def full_mask_png_base64(image: Image.Image) -> str:
+    mask = Image.new("L", image.size, 255)
+    buffer = io.BytesIO()
+    mask.save(buffer, format="PNG")
+    return base64.b64encode(buffer.getvalue()).decode("ascii")
+
+
+def original_image_fallback_payload(image: Image.Image, reason: str) -> dict:
+    width, height = image.size
+    return {
+        "score": None,
+        "area": width * height,
+        "area_ratio": 1.0,
+        "bbox_xyxy": [0, 0, width, height],
+        "bbox_xywh": [0, 0, width, height],
+        "prompt_box_xyxy": None,
+        "model_type": None,
+        "checkpoint": None,
+        "mask_png_base64": full_mask_png_base64(image),
+        "isolated_png_base64": encode_png_base64(image),
+        "segmentation_status": "fallback_original",
+        "segmentation_reason": reason,
+        "status": "success",
+    }
+
+
+def parse_box_prompt(box: Optional[str]):
+    if not box:
+        return None
+
+    parts = [part.strip() for part in box.split(",") if part.strip()]
+    if len(parts) != 4:
+        raise ValueError("box must be formatted as x1,y1,x2,y2.")
+
+    return [float(part) for part in parts]
+
+
+def parse_point_prompts(point_coords: Optional[str], point_labels: Optional[str]):
+    if not point_coords:
+        return None, None
+
+    coords = []
+    for pair in point_coords.split(";"):
+        pair = pair.strip()
+        if not pair:
+            continue
+
+        values = [value.strip() for value in pair.split(",") if value.strip()]
+        if len(values) != 2:
+            raise ValueError("point_coords must be formatted as x,y;x,y.")
+        coords.append([float(values[0]), float(values[1])])
+
+    if not coords:
+        raise ValueError("point_coords did not contain any valid points.")
+
+    if not point_labels:
+        return coords, [1] * len(coords)
+
+    labels = [int(value.strip()) for value in point_labels.split(",") if value.strip()]
+    if len(labels) != len(coords):
+        raise ValueError("point_labels must contain one label per point.")
+
+    invalid_labels = [label for label in labels if label not in (0, 1)]
+    if invalid_labels:
+        raise ValueError("point_labels must only contain 0 (background) or 1 (foreground).")
+
+    return coords, labels
+
+
+async def maybe_segment_clothing(
+    image: Image.Image,
+    field_name: str,
+    enabled: bool,
+):
+    if not enabled:
+        return image, {"status": "disabled"}
+
+    try:
+        result = await run_in_threadpool(sam_segmenter.segment, image)
+        quality = mask_quality(result.mask)
+        if not quality["usable"]:
+            metadata = result.to_metadata()
+            metadata.update(quality)
+            metadata["status"] = "fallback_original"
+            return image, metadata
+
+        isolated = apply_mask(image, result.mask, crop=True)
+        metadata = result.to_metadata()
+        metadata.update(quality)
+        metadata["status"] = "applied"
+        return isolated, metadata
+    except SamUnavailableError as exc:
+        logger.info("SAM skipped for %s: %s", field_name, exc)
+        return image, {"status": "skipped", "reason": str(exc)}
+    except Exception as exc:
+        logger.exception("SAM segmentation failed for %s", field_name)
+        return image, {"status": "failed", "error": str(exc)}
+
+
+@app.get("/sam-status")
+async def sam_status():
+    return JSONResponse(content=sam_segmenter.status())
+
+
+@app.post("/segment-garment")
+async def segment_garment(
+    image: UploadFile = File(...),
+    box: Optional[str] = Form(None),
+    point_coords: Optional[str] = Form(None),
+    point_labels: Optional[str] = Form(None),
+    crop: bool = Form(True),
+    require_segmentation: bool = Form(False),
+):
+    img = None
+    try:
+        img = await read_upload_image(image, "image")
+        parsed_box = parse_box_prompt(box)
+        parsed_points, parsed_labels = parse_point_prompts(point_coords, point_labels)
+        result = await run_in_threadpool(
+            sam_segmenter.segment,
+            img,
+            parsed_box,
+            parsed_points,
+            parsed_labels,
+        )
+        quality = mask_quality(result.mask)
+        if not quality["usable"]:
+            if require_segmentation:
+                return JSONResponse(
+                    content={"error": quality["reason"], "status": "failed"},
+                    status_code=422,
+                )
+
+            metadata = result.to_metadata()
+            payload = original_image_fallback_payload(img, quality["reason"])
+            payload.update(metadata)
+            payload.update(quality)
+            payload["segmentation_status"] = "fallback_original"
+            return JSONResponse(content=payload)
+
+        isolated = apply_mask(img, result.mask, crop=crop)
+
+        payload = result.to_metadata()
+        payload.update(quality)
+        payload.update(
+            {
+                "mask_png_base64": base64.b64encode(
+                    mask_to_png_bytes(result.mask)
+                ).decode("ascii"),
+                "isolated_png_base64": encode_png_base64(isolated),
+                "segmentation_status": "applied",
+                "status": "success",
+            }
+        )
+        return JSONResponse(content=payload)
+    except ValueError as exc:
+        return JSONResponse(content={"error": str(exc), "status": "failed"}, status_code=400)
+    except SamUnavailableError as exc:
+        if require_segmentation:
+            return JSONResponse(content={"error": str(exc), "status": "failed"}, status_code=503)
+
+        return JSONResponse(content=original_image_fallback_payload(img, str(exc)))
+    except Exception as exc:
+        logger.exception("SAM segmentation failed")
+        if require_segmentation:
+            return JSONResponse(content={"error": str(exc), "status": "failed"}, status_code=500)
+
+        if img is None:
+            return JSONResponse(content={"error": str(exc), "status": "failed"}, status_code=500)
+
+        return JSONResponse(content=original_image_fallback_payload(img, str(exc)))
+
+
 # 4. The API Endpoint Next.js will call.
 @app.post("/predict-match")
 async def predict_match(
     shirt_image: UploadFile = File(...),
     pants_image: UploadFile = File(...),
     skin_tone: str = Form("neutral"),
+    use_segmentation: bool = Form(True),
 ):
     try:
         shirt_img = await read_upload_image(shirt_image, "shirt_image")
         pants_img = await read_upload_image(pants_image, "pants_image")
+        shirt_img, shirt_segmentation = await maybe_segment_clothing(
+            shirt_img,
+            "shirt_image",
+            use_segmentation,
+        )
+        pants_img, pants_segmentation = await maybe_segment_clothing(
+            pants_img,
+            "pants_image",
+            use_segmentation,
+        )
 
         shirt_color = analyze_clothing_color(shirt_img)
         pants_color = analyze_clothing_color(pants_img)
@@ -286,6 +487,11 @@ async def predict_match(
             "pants_detected_as": pants_color["temperature"],
             "shirt_color": shirt_color,
             "pants_color": pants_color,
+            "segmentation": {
+                "enabled": use_segmentation,
+                "shirt": shirt_segmentation,
+                "pants": pants_segmentation,
+            },
             "status": "success",
         })
     except ValueError as exc:

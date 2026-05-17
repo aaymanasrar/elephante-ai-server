@@ -79,7 +79,15 @@ def parse_args():
     )
     p.add_argument(
         "--limit", type=int, default=0,
-        help="Stop after downloading this many items (0 = all ~200 K).",
+        help="Max items to download (0 = all ~200 K). Use with --stride to sample evenly.",
+    )
+    p.add_argument(
+        "--stride", type=int, default=1,
+        help=(
+            "Only process every Nth row. Use to sample across all categories without "
+            "downloading the full dataset. E.g. --limit 5000 --stride 40 samples "
+            "5000 rows spread evenly across all 200K rows."
+        ),
     )
     p.add_argument(
         "--pairs-per-category", type=int, default=500,
@@ -162,8 +170,13 @@ def main():
 
     items_by_cat: dict[str, list[Path]] = {}
     count = 0
+    row_index = 0
 
     for row in ds:
+        row_index += 1
+        if args.stride > 1 and (row_index % args.stride) != 0:
+            continue
+
         if args.limit and count >= args.limit:
             break
 
@@ -177,8 +190,8 @@ def main():
         if args.dry_run:
             items_by_cat.setdefault(cat, []).append(Path("(dry-run)"))
             count += 1
-            if count % 5000 == 0:
-                print(f"  scanned {count} rows …")
+            if row_index % 10000 == 0:
+                print(f"  scanned {row_index} rows, kept {count} …")
             continue
 
         slug = category_slug(cat)
